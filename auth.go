@@ -3,13 +3,14 @@ package httpDigestAuth
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type myjar struct {
@@ -31,6 +32,56 @@ type DigestHeaders struct {
 	Nc        int16
 	Username  string
 	Password  string
+	Client    *http.Client
+}
+
+func defaultHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	if transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+}
+
+func (d *DigestHeaders) client() *http.Client {
+	baseClient := d.Client
+	if baseClient == nil {
+		baseClient = defaultHTTPClient()
+	}
+
+	client := *baseClient
+	if client.Timeout == 0 {
+		client.Timeout = 30 * time.Second
+	}
+	if client.Transport == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		if transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+		}
+		client.Transport = transport
+	}
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		if transport.TLSClientConfig.MinVersion == 0 || transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+		}
+	}
+
+	jar := &myjar{}
+	jar.jar = make(map[string][]*http.Cookie)
+	client.Jar = jar
+	return &client
 }
 
 func (p *myjar) SetCookies(u *url.URL, cookies []*http.Cookie) {
@@ -93,55 +144,66 @@ func (d *DigestHeaders) ApplyAuth(req *http.Request) {
 	req.Header.Set("Authorization", AuthHeader)
 }
 
-// Auth authenticates against a given URI
+// Auth authenticates against a given URI.
 func (d *DigestHeaders) Auth(username string, password string, uri string) (*DigestHeaders, error) {
-
-	client := &http.Client{}
-	jar := &myjar{}
-	jar.jar = make(map[string][]*http.Cookie)
-	client.Jar = jar
+	client := d.client()
 
 	req, err := http.NewRequest("GET", uri, nil)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	if resp.StatusCode == 401 {
+	defer resp.Body.Close()
 
-		authn := digestAuthParams(resp)
-		algorithm := authn["algorithm"]
-		d := &DigestHeaders{}
-		u, _ := url.Parse(uri)
-		d.Path = u.RequestURI()
-		d.Realm = authn["realm"]
-		d.Qop = authn["qop"]
-		d.Nonce = authn["nonce"]
-		d.Opaque = authn["opaque"]
-		if algorithm == "" {
-			d.Algorithm = "MD5"
-		} else {
-			d.Algorithm = authn["algorithm"]
-		}
-		d.Nc = 0x0
-		d.Username = username
-		d.Password = password
-
-		req, err = http.NewRequest("GET", uri, nil)
-		d.ApplyAuth(req)
-		resp, err = client.Do(req)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if resp.StatusCode != 200 {
-			d = &DigestHeaders{}
-			err = fmt.Errorf("response status code was %v", resp.StatusCode)
-		}
-		return d, err
+	if resp.StatusCode != http.StatusUnauthorized {
+		return nil, fmt.Errorf("response status code should have been 401, it was %v", resp.StatusCode)
 	}
-	return nil, fmt.Errorf("response status code should have been 401, it was %v", resp.StatusCode)
+
+	authn := digestAuthParams(resp)
+	if authn == nil {
+		return nil, fmt.Errorf("missing Digest authentication challenge")
+	}
+
+	algorithm := authn["algorithm"]
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	authState := &DigestHeaders{
+		Path:     parsed.RequestURI(),
+		Realm:    authn["realm"],
+		Qop:      authn["qop"],
+		Nonce:    authn["nonce"],
+		Opaque:   authn["opaque"],
+		Nc:       0x0,
+		Username: username,
+		Password: password,
+		Client:   client,
+	}
+	if algorithm == "" {
+		authState.Algorithm = "MD5"
+	} else {
+		authState.Algorithm = algorithm
+	}
+
+	req, err = http.NewRequest("GET", uri, nil)
+	if err != nil {
+		return nil, err
+	}
+	authState.ApplyAuth(req)
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("response status code was %v", resp.StatusCode)
+	}
+	return authState, nil
 }
 
 /*
